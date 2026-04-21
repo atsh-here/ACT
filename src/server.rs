@@ -33,6 +33,25 @@ use rand::RngCore;
 // Server Configuration
 // ============================================================================
 
+/// Controls whether the server enforces a specific plaintext spend amount or
+/// allows the client to choose (and optionally hide) the amount.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpendAmountPolicy {
+    /// The server does not enforce a particular spend amount.  Clients may
+    /// reveal their spend amount in plaintext **or** hide it using the
+    /// hidden-spend extension (Section 4.4, hidden-spend mode).  This is the
+    /// correct policy for pure rate-limiting deployments where the server only
+    /// needs to know that the client spent *some* positive amount (≥ 1) per
+    /// operation.
+    Flexible,
+    /// The server requires the client to reveal a specific, exact spend amount
+    /// in plaintext.  Hidden-spend proofs are rejected with an error.  Use
+    /// this when the server must levy a precise number of credits (e.g., an
+    /// expensive API call costs exactly 10 credits).
+    Enforced(u32),
+}
+
 #[cfg(feature = "server")]
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -42,7 +61,16 @@ pub struct ServerConfig {
     pub current_epoch: u32,
     /// Grace period in seconds after epoch rollover during which the previous
     /// epoch's spend nullifiers are still accepted.
+    ///
+    /// **Default: 0 (zero-grace mode).**  Setting this to 0 provides strict
+    /// per-epoch rate limiting: a token issued in epoch `T−1` is **never**
+    /// accepted during epoch `T`, eliminating the 2×c_max burst window.
+    /// Set to a positive value (e.g., 300 for 5 minutes) only when soft epoch
+    /// transitions are required for fault tolerance.  See Section 7.10 of the
+    /// paper for the security trade-offs.
     pub epoch_grace_period_secs: u64,
+    /// Spend-amount policy enforced by this server instance.
+    pub spend_amount_policy: SpendAmountPolicy,
     /// TTL for idempotency cache entries (seconds).
     pub idempotency_ttl_secs: u64,
     /// TTL for nonce cache entries (standard mode) (seconds).
@@ -58,7 +86,8 @@ impl Default for ServerConfig {
         Self {
             redis_url: "redis://127.0.0.1:6379".to_string(),
             current_epoch: 0,
-            epoch_grace_period_secs: 300, // 5 minutes
+            epoch_grace_period_secs: 0, // zero-grace by default
+            spend_amount_policy: SpendAmountPolicy::Flexible,
             idempotency_ttl_secs: 60,
             nonce_ttl_secs: 60,
             high_privacy_batch_size: 10000,

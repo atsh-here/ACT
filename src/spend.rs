@@ -45,11 +45,20 @@ pub struct SpendProof {
     pub z_v:        Scalar,
     pub z_w:        Scalar,
     pub batched_eq: BatchedEqualityProof,
+    /// Plaintext spend amount.  Set to `0` when the spend amount is hidden
+    /// (indicated by `c_s.is_some()`).
     pub s:          u32,
     pub k_cur:      Scalar,
     pub t_issue:    u32,
     pub k_prime:    G1Projective,
     pub c_bp:       G1Projective,
+    /// Hidden-spend commitment `C_s = s·h_4`.  `None` for revealed spend.
+    /// When `Some`, the verifier uses `C_s` in the MSM in place of the
+    /// plaintext `s`, and `beq_spend` holds the range proof for `s − 1`.
+    pub c_s:        Option<G1Projective>,
+    /// BEQ range proof proving `s − 1 ∈ [0, 2³²−1]`.
+    /// Present if and only if `c_s` is `Some`.
+    pub beq_spend:  Option<BatchedEqualityProof>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -84,6 +93,11 @@ impl SpendProver {
         c_bal: u32,
         t_issue: u32,
         spend_amount: u32,
+        /// When `true` the spend amount is kept private: `C_s = spend_amount·h_4`
+        /// is included in the proof and a BEQ range proof for `spend_amount − 1`
+        /// is generated.  When `false` (default) `spend_amount` is disclosed in
+        /// plaintext, matching the original protocol.
+        hidden_spend: bool,
         nonce: &[u8; 16],
         generators: &Generators,
         pk_daily: &G2Projective,
@@ -170,10 +184,23 @@ impl SpendProver {
             &[rho_m.0, rho_w.0],
         );
 
-        // BatchedEqualityProof
+        // Compute C_s = spend_amount · h4 for hidden-spend mode.
+        // This is an unblinded BLS commitment; DL hardness ensures the prover
+        // cannot extract spend_amount from C_s without solving DL on G1.
+        let c_s_opt: Option<G1Projective> = if hidden_spend {
+            Some(&generators.h[4] * &Scalar::from(spend_amount).0)
+        } else {
+            None
+        };
+
+        // BatchedEqualityProof context: bind h_ctx, spend identifier (plaintext
+        // amount OR compressed C_s point), k_cur, t_issue, and nonce.
         let mut beq_ctx = Vec::new();
         beq_ctx.extend_from_slice(&h_ctx.to_bytes());
-        beq_ctx.extend_from_slice(&spend_amount.to_le_bytes());
+        match c_s_opt {
+            Some(c_s) => beq_ctx.extend_from_slice(&G1Affine::from(c_s).to_compressed()),
+            None      => beq_ctx.extend_from_slice(&spend_amount.to_le_bytes()),
+        }
         beq_ctx.extend_from_slice(&k_cur.to_bytes());
         beq_ctx.extend_from_slice(&t_issue.to_le_bytes());
         beq_ctx.extend_from_slice(nonce);
@@ -196,7 +223,7 @@ impl SpendProver {
         let beq_bytes = batched_eq.to_bytes();
 
         let c = Self::challenge(
-            h_ctx, pk_daily, spend_amount, &k_cur, t_issue, nonce,
+            h_ctx, pk_daily, spend_amount, c_s_opt, &k_cur, t_issue, nonce,
             k_prime, c_total, c_bp, &beq_bytes,
             a_prime, a_bar, t_bbs,
             t_scale_t, t_total, t_scale_r, t_refund, t_scale_bp, t_bp,
@@ -210,13 +237,47 @@ impl SpendProver {
         let z_v = rho_v + c * (r_star * r1);
         let z_w = rho_w + c * (r_bp * r1);
 
+        // Hidden-spend BEQ: prove s − 1 ∈ [0, 2³²−1].
+        // The BLS commitment is C_s − h4 = (s−1)·h4 (blinding factor zero).
+        let beq_spend_opt: Option<BatchedEqualityProof> = if let Some(c_s) = c_s_opt {
+            let mut beq_spend_ctx = Vec::new();
+            beq_spend_ctx.extend_from_slice(&h_ctx.to_bytes());
+            beq_spend_ctx.extend_from_slice(b"ACT:HiddenSpend");
+            beq_spend_ctx.extend_from_slice(&k_cur.to_bytes());
+            beq_spend_ctx.extend_from_slice(&t_issue.to_le_bytes());
+            beq_spend_ctx.extend_from_slice(nonce);
+            let beq_spend_comms = [
+                G1Affine::from(a_prime),
+                G1Affine::from(a_bar),
+                G1Affine::from(t_bbs),
+                G1Affine::from(c_s),
+            ];
+            // spend_amount >= 1 is guaranteed by the check at the top of prove().
+            let (beq_spend, _) = prove_batched_equality(
+                &mut fast_rng,
+                spend_amount - 1,
+                BlsScalar::ZERO,  // C_s has no randomness blinder on the BLS side
+                generators.h[4],
+                generators.h[0],
+                &beq_spend_ctx,
+                &beq_spend_comms,
+            )?;
+            Some(beq_spend)
+        } else {
+            None
+        };
+
         Ok((
             SpendClient { k_cur, c_bal, t_issue, k_star, r_star, r_bp },
             SpendProof {
                 a_prime, a_bar, t_bbs,
                 t_scale_t, t_total, t_scale_r, t_refund, t_scale_bp, t_bp,
                 z_e, z_r1, z_s_tilde, z_c_tilde, z_u, z_v, z_w,
-                batched_eq, s: spend_amount, k_cur, t_issue, k_prime, c_bp,
+                batched_eq,
+                s: if hidden_spend { 0 } else { spend_amount },
+                k_cur, t_issue, k_prime, c_bp,
+                c_s: c_s_opt,
+                beq_spend: beq_spend_opt,
             },
         ))
     }
@@ -226,6 +287,8 @@ impl SpendProver {
         h_ctx: Scalar,
         pk_daily: &G2Projective,
         spend_amount: u32,
+        /// `Some(C_s)` when the spend amount is hidden; `None` when revealed.
+        c_s: Option<G1Projective>,
         k_cur: &Scalar,
         t_issue: u32,
         nonce: &[u8; 16],
@@ -247,7 +310,11 @@ impl SpendProver {
         let mut w = HasherWriter(&mut hasher);
         write_scalar(&mut w, h_ctx);
         write_g2(&mut w, *pk_daily);
-        w.write_all(&spend_amount.to_le_bytes()).unwrap();
+        // Hidden spend: hash the C_s commitment instead of the plaintext amount.
+        match c_s {
+            Some(cs) => write_g1(&mut w, cs),
+            None     => w.write_all(&spend_amount.to_le_bytes()).unwrap(),
+        }
         w.write_all(&k_cur.to_bytes()).unwrap();
         w.write_all(&t_issue.to_le_bytes()).unwrap();
         w.write_all(nonce).unwrap();
@@ -274,6 +341,19 @@ impl SpendProver {
 // Server Verifier
 // ============================================================================
 
+/// Verify a single [`SpendProof`].
+///
+/// # Parameters
+///
+/// * `allow_prev_epoch` – when `true` the verifier accepts tokens issued in
+///   epoch `current_epoch − 1` (grace-period mode).  When `false` only
+///   tokens whose `t_issue == current_epoch` are accepted.
+///   **Set to `false` for deployments that require zero-grace strict rate
+///   limiting.**
+///
+/// * `required_spend_amount` – when `Some(x)` the verifier enforces that the
+///   proof reveals `s == x` in plaintext (hidden spend is rejected).  When
+///   `None` both plaintext and hidden spends are accepted.
 pub fn verify_spend(
     proof: &SpendProof,
     current_epoch: u32,
@@ -283,22 +363,52 @@ pub fn verify_spend(
     keys: &ServerKeys,
     h_ctx: Scalar,
     rng: &mut impl RngCore,
+    allow_prev_epoch: bool,
+    required_spend_amount: Option<u32>,
 ) -> Result<SpendResponse> {
-    if proof.s == 0 {
+    let hidden = proof.c_s.is_some();
+
+    // ── Amount / mode policy checks ──────────────────────────────────────────
+    if let Some(required) = required_spend_amount {
+        // Server enforces an exact plaintext amount.
+        if hidden {
+            return Err(ActError::VerificationFailed(
+                "Hidden spend not permitted when server enforces a specific amount".into(),
+            ));
+        }
+        if proof.s != required {
+            return Err(ActError::VerificationFailed(
+                alloc::format!("Spend amount mismatch: expected {required}, got {}", proof.s),
+            ));
+        }
+    }
+    if !hidden && proof.s == 0 {
         return Err(ActError::VerificationFailed("Spend amount must be positive".into()));
     }
-    if proof.t_issue != current_epoch && proof.t_issue.saturating_add(1) != current_epoch {
+
+    // ── Epoch check ───────────────────────────────────────────────────────────
+    let epoch_ok = proof.t_issue == current_epoch
+        || (allow_prev_epoch && proof.t_issue.saturating_add(1) == current_epoch);
+    if !epoch_ok {
         return Err(ActError::VerificationFailed("Epoch mismatch".into()));
     }
+
     if bool::from(proof.a_prime.is_identity()) || bool::from(proof.t_bbs.is_identity()) {
         return Err(ActError::VerificationFailed("Zero point in proof".into()));
     }
 
-    let c_total  = &proof.k_prime + &(&generators.h[4] * &Scalar::from(proof.s).0);
+    // ── C_total derivation ────────────────────────────────────────────────────
+    // Revealed: C_total = K' + s·h4  (server recomputes from plaintext s).
+    // Hidden:   C_total = K' + C_s   (server uses the proof-supplied point).
+    let c_total = match proof.c_s {
+        Some(c_s) => proof.k_prime + c_s,
+        None      => &proof.k_prime + &(&generators.h[4] * &Scalar::from(proof.s).0),
+    };
+
     let beq_bytes = proof.batched_eq.to_bytes();
 
     let c = SpendProver::challenge(
-        h_ctx, pk_daily, proof.s, &proof.k_cur, proof.t_issue, nonce,
+        h_ctx, pk_daily, proof.s, proof.c_s, &proof.k_cur, proof.t_issue, nonce,
         proof.k_prime, c_total, proof.c_bp, &beq_bytes,
         proof.a_prime, proof.a_bar, proof.t_bbs,
         proof.t_scale_t, proof.t_total, proof.t_scale_r, proof.t_refund,
@@ -311,19 +421,25 @@ pub fn verify_spend(
         let c2 = &c_fr * &c_fr;
         let c3 = &c2   * &c_fr;
         let ti = BlsScalar::from(proof.t_issue as u64);
-        let sf = BlsScalar::from(proof.s as u64);
+
+        // sc_h4 and the dynamic-point list differ by mode:
+        //   Revealed: sc_h4 = (c+1+c2+c3)·z_c̃ − (c2+c3)·s·z_r1
+        //   Hidden:   sc_h4 = (c+1+c2+c3)·z_c̃          (no s term)
+        //             + add C_s with coefficient −(c2+c3)·z_r1
+        let (sc_h4, extra_point, extra_scalar) = if hidden {
+            let sc = (&c_fr + &(&BlsScalar::ONE + &(&c2 + &c3))) * &proof.z_c_tilde.0;
+            let sc_cs = -((&c2 + &c3) * &proof.z_r1.0);
+            (sc, proof.c_s, Some(sc_cs))
+        } else {
+            let sf = BlsScalar::from(proof.s as u64);
+            let t1 = (&c_fr + &(&BlsScalar::ONE + &(&c2 + &c3))) * &proof.z_c_tilde.0;
+            let t2 = (&c2 + &c3) * &(&sf * &proof.z_r1.0);
+            (&t1 - &t2, None, None)
+        };
 
         let sc_h0 = &(&(&c_fr + &c2) * &proof.z_v.0) + &(&(&c3 * &proof.z_w.0) + &proof.z_s_tilde.0);
         let sc_h1 = &(&(&c_fr + &c2) * &proof.z_u.0) + &(&proof.k_cur.0 * &proof.z_r1.0);
         let sc_h2 = &(&(&c_fr + &(&c2 + &BlsScalar::ONE)) * &ti) * &proof.z_r1.0;
-        let sc_h4 = {
-            let zc = proof.z_c_tilde.0;
-            let zr = proof.z_r1.0;
-            // (c+1+c2+c3)*z_c - (c2+c3)*s*z_r1
-            let t1 = &(&c_fr + &(&BlsScalar::ONE + &(&c2 + &c3))) * &zc;
-            let t2 = &(&c2 + &c3) * &(&sf * &zr);
-            &t1 - &t2
-        };
         let sc_g1      = proof.z_r1.0;
         let sc_aprime  = -proof.z_e.0;
         let sc_ctotal  = -(&c_fr * &proof.z_r1.0);
@@ -338,11 +454,22 @@ pub fn verify_spend(
         let sc_tscale_bp =  c3;
         let sc_tbbs      = -BlsScalar::ONE;
 
-        let dyn_pts = batch_normalize(&[
+        let mut dyn_pts_proj = vec![
             proof.a_prime, c_total, proof.k_prime, proof.c_bp, proof.a_bar,
             proof.t_total, proof.t_scale_t, proof.t_refund, proof.t_scale_r,
             proof.t_bp, proof.t_scale_bp, proof.t_bbs,
-        ]);
+        ];
+        let mut var_scalars = vec![
+            sc_aprime, sc_ctotal, sc_kprime, sc_cbp, sc_abar,
+            sc_ttotal, sc_tscale_t, sc_trefund, sc_tscale_r,
+            sc_tbp, sc_tscale_bp, sc_tbbs,
+        ];
+        if let (Some(pt), Some(sc)) = (extra_point, extra_scalar) {
+            dyn_pts_proj.push(pt);
+            var_scalars.push(sc);
+        }
+
+        let dyn_pts = batch_normalize(&dyn_pts_proj);
 
         // Fixed-base part: use precomputed tables for the 5 protocol generators.
         let mut fixed_sum = generators.h_tables[0].mul(&sc_h0);
@@ -351,22 +478,20 @@ pub fn verify_spend(
         fixed_sum = &fixed_sum + &generators.h_tables[4].mul(&sc_h4);
         fixed_sum = &fixed_sum + &generators.g1_table.mul(&sc_g1);
 
-        // Variable-base part: 12 dynamic proof points via Pippenger MSM.
-        let var_scalars = [
-            sc_aprime, sc_ctotal, sc_kprime, sc_cbp, sc_abar,
-            sc_ttotal, sc_tscale_t, sc_trefund, sc_tscale_r,
-            sc_tbp, sc_tscale_bp, sc_tbbs,
-        ];
+        // Variable-base part: dynamic proof points via Pippenger MSM.
         let combined = &fixed_sum + &g1_msm(&dyn_pts, &var_scalars);
         if !bool::from(combined.is_identity()) {
             return Err(ActError::VerificationFailed("Combined bridge+Schnorr check failed".into()));
         }
     }
 
-    // Build BatchedEqualityProof context and commitment list (used in rayon::join below).
+    // Build BatchedEqualityProof context and commitment list.
     let mut beq_ctx = Vec::new();
     beq_ctx.extend_from_slice(&h_ctx.to_bytes());
-    beq_ctx.extend_from_slice(&proof.s.to_le_bytes());
+    match proof.c_s {
+        Some(c_s) => beq_ctx.extend_from_slice(&G1Affine::from(c_s).to_compressed()),
+        None      => beq_ctx.extend_from_slice(&proof.s.to_le_bytes()),
+    }
     beq_ctx.extend_from_slice(&proof.k_cur.to_bytes());
     beq_ctx.extend_from_slice(&proof.t_issue.to_le_bytes());
     beq_ctx.extend_from_slice(nonce);
@@ -378,9 +503,7 @@ pub fn verify_spend(
         G1Affine::from(c_total),
     ];
 
-    // BatchedEqualityProof + Pairing check run concurrently (mathematically
-    // isolated: no shared mutable state).  rayon::join offloads one branch to
-    // the thread pool, cutting combined latency from ~7ms to ~4ms.
+    // BatchedEqualityProof (refund range) + Pairing check run concurrently.
     let (beq_result, pairing_ok) = rayon::join(
         || {
             verify_batched_equality(
@@ -401,6 +524,37 @@ pub fn verify_spend(
     beq_result?;
     if !pairing_ok {
         return Err(ActError::VerificationFailed("Pairing check failed".into()));
+    }
+
+    // Hidden-spend BEQ: verify s − 1 ∈ [0, 2³²−1].
+    if let (Some(c_s), Some(beq_spend)) = (proof.c_s, &proof.beq_spend) {
+        let mut beq_spend_ctx = Vec::new();
+        beq_spend_ctx.extend_from_slice(&h_ctx.to_bytes());
+        beq_spend_ctx.extend_from_slice(b"ACT:HiddenSpend");
+        beq_spend_ctx.extend_from_slice(&proof.k_cur.to_bytes());
+        beq_spend_ctx.extend_from_slice(&proof.t_issue.to_le_bytes());
+        beq_spend_ctx.extend_from_slice(nonce);
+        let beq_spend_comms = [
+            G1Affine::from(proof.a_prime),
+            G1Affine::from(proof.a_bar),
+            G1Affine::from(proof.t_bbs),
+            G1Affine::from(c_s),
+        ];
+        // The BLS commitment for the spend BEQ is C_s − h4 = (s−1)·h4.
+        let c_s_minus_h4 = c_s - generators.h[4];
+        verify_batched_equality(
+            beq_spend,
+            c_s_minus_h4,
+            generators.h[4],
+            generators.h[0],
+            &beq_spend_ctx,
+            &beq_spend_comms,
+        )?;
+    } else if hidden {
+        // c_s is Some but beq_spend is None: malformed proof.
+        return Err(ActError::VerificationFailed(
+            "Hidden spend proof missing spend range proof".into(),
+        ));
     }
 
     // Issue Refund Token
@@ -429,6 +583,9 @@ pub fn verify_spend(
 /// `nonces` must be the same length as `proofs`; each entry is the anti-replay
 /// nonce for the corresponding proof.
 ///
+/// `allow_prev_epoch` and `required_spend_amount` have the same semantics as in
+/// [`verify_spend`].
+///
 /// # Batching strategy
 ///
 /// * **Schnorr MSM** – per-proof Schwartz–Zippel equations combined into one
@@ -453,6 +610,8 @@ pub fn verify_spend_batch(
     keys: &ServerKeys,
     h_ctx: Scalar,
     rng: &mut impl RngCore,
+    allow_prev_epoch: bool,
+    required_spend_amount: Option<u32>,
 ) -> Result<Vec<SpendResponse>> {
     use rayon::prelude::*;
 
@@ -465,8 +624,10 @@ pub fn verify_spend_batch(
         return Ok(Vec::new());
     }
     if proofs.len() == 1 {
-        return verify_spend(&proofs[0], current_epoch, &nonces[0], generators, pk_daily, keys, h_ctx, rng)
-            .map(|r| vec![r]);
+        return verify_spend(
+            &proofs[0], current_epoch, &nonces[0], generators, pk_daily, keys, h_ctx, rng,
+            allow_prev_epoch, required_spend_amount,
+        ).map(|r| vec![r]);
     }
 
     let n = proofs.len();
@@ -478,19 +639,37 @@ pub fn verify_spend_batch(
     }
     let mut per_proof = Vec::with_capacity(n);
     for (proof, nonce) in proofs.iter().zip(nonces.iter()) {
-        if proof.s == 0 {
+        let hidden = proof.c_s.is_some();
+        if let Some(required) = required_spend_amount {
+            if hidden {
+                return Err(ActError::VerificationFailed(
+                    "Hidden spend not permitted when server enforces a specific amount".into(),
+                ));
+            }
+            if proof.s != required {
+                return Err(ActError::VerificationFailed(
+                    alloc::format!("Spend amount mismatch: expected {required}, got {}", proof.s),
+                ));
+            }
+        }
+        if !hidden && proof.s == 0 {
             return Err(ActError::VerificationFailed("Spend amount must be positive".into()));
         }
-        if proof.t_issue != current_epoch && proof.t_issue.saturating_add(1) != current_epoch {
+        let epoch_ok = proof.t_issue == current_epoch
+            || (allow_prev_epoch && proof.t_issue.saturating_add(1) == current_epoch);
+        if !epoch_ok {
             return Err(ActError::VerificationFailed("Epoch mismatch".into()));
         }
         if bool::from(proof.a_prime.is_identity()) || bool::from(proof.t_bbs.is_identity()) {
             return Err(ActError::VerificationFailed("Zero point in proof".into()));
         }
-        let c_total   = &proof.k_prime + &(&generators.h[4] * &Scalar::from(proof.s).0);
+        let c_total = match proof.c_s {
+            Some(c_s) => proof.k_prime + c_s,
+            None      => &proof.k_prime + &(&generators.h[4] * &Scalar::from(proof.s).0),
+        };
         let beq_bytes = proof.batched_eq.to_bytes();
         let c = SpendProver::challenge(
-            h_ctx, pk_daily, proof.s, &proof.k_cur, proof.t_issue, nonce,
+            h_ctx, pk_daily, proof.s, proof.c_s, &proof.k_cur, proof.t_issue, nonce,
             proof.k_prime, c_total, proof.c_bp, &beq_bytes,
             proof.a_prime, proof.a_bar, proof.t_bbs,
             proof.t_scale_t, proof.t_total, proof.t_scale_r, proof.t_refund,
@@ -519,9 +698,9 @@ pub fn verify_spend_batch(
     let mut acc_h4 = BlsScalar::ZERO;
     let mut acc_g1 = BlsScalar::ZERO;
 
-    // Dynamic bases (12 per proof).
-    let mut dyn_bases:   Vec<G1Affine>  = Vec::with_capacity(12 * n);
-    let mut dyn_scalars: Vec<BlsScalar> = Vec::with_capacity(12 * n);
+    // Dynamic bases (12 per revealed-spend proof, 13 per hidden-spend proof).
+    let mut dyn_bases:   Vec<G1Affine>  = Vec::with_capacity(13 * n);
+    let mut dyn_scalars: Vec<BlsScalar> = Vec::with_capacity(13 * n);
 
     for (i, (proof, pp)) in proofs.iter().zip(per_proof.iter()).enumerate() {
         let rho  = rhos[i];
@@ -529,18 +708,25 @@ pub fn verify_spend_batch(
         let c2   = &c_fr * &c_fr;
         let c3   = &c2   * &c_fr;
         let ti   = BlsScalar::from(proof.t_issue as u64);
-        let sf   = BlsScalar::from(proof.s as u64);
+        let hidden = proof.c_s.is_some();
+
+        // sc_h4 differs by mode (see verify_spend for derivation).
+        let (sc_h4, extra_point_proj, extra_scalar_opt) = if hidden {
+            let sc = (&c_fr + &(&BlsScalar::ONE + &(&c2 + &c3))) * &proof.z_c_tilde.0;
+            let sc_cs = -((&c2 + &c3) * &proof.z_r1.0);
+            (sc, proof.c_s, Some(sc_cs))
+        } else {
+            let sf = BlsScalar::from(proof.s as u64);
+            let t1 = (&c_fr + &(&BlsScalar::ONE + &(&c2 + &c3))) * &proof.z_c_tilde.0;
+            let t2 = (&c2 + &c3) * &(&sf * &proof.z_r1.0);
+            (&t1 - &t2, None, None)
+        };
 
         let sc_h0 = &(&(&c_fr + &c2) * &proof.z_v.0)
             + &(&(&c3 * &proof.z_w.0) + &proof.z_s_tilde.0);
         let sc_h1 = &(&(&c_fr + &c2) * &proof.z_u.0)
             + &(&proof.k_cur.0 * &proof.z_r1.0);
         let sc_h2 = &(&(&c_fr + &(&c2 + &BlsScalar::ONE)) * &ti) * &proof.z_r1.0;
-        let sc_h4 = {
-            let t1 = &(&c_fr + &(&BlsScalar::ONE + &(&c2 + &c3))) * &proof.z_c_tilde.0;
-            let t2 = &(&c2 + &c3) * &(&sf * &proof.z_r1.0);
-            &t1 - &t2
-        };
         let sc_g1       = proof.z_r1.0;
         let sc_aprime   = -proof.z_e.0;
         let sc_ctotal   = -(&c_fr * &proof.z_r1.0);
@@ -561,25 +747,22 @@ pub fn verify_spend_batch(
         acc_h4 = &acc_h4 + &(&rho * &sc_h4);
         acc_g1 = &acc_g1 + &(&rho * &sc_g1);
 
-        let dyn_pts = batch_normalize(&[
+        let mut dyn_pts_proj = vec![
             proof.a_prime, pp.c_total, proof.k_prime, proof.c_bp, proof.a_bar,
             proof.t_total, proof.t_scale_t, proof.t_refund, proof.t_scale_r,
             proof.t_bp, proof.t_scale_bp, proof.t_bbs,
-        ]);
-        for (sc, pt) in [
-            (sc_aprime,    dyn_pts[0]),
-            (sc_ctotal,    dyn_pts[1]),
-            (sc_kprime,    dyn_pts[2]),
-            (sc_cbp,       dyn_pts[3]),
-            (sc_abar,      dyn_pts[4]),
-            (sc_ttotal,    dyn_pts[5]),
-            (sc_tscale_t,  dyn_pts[6]),
-            (sc_trefund,   dyn_pts[7]),
-            (sc_tscale_r,  dyn_pts[8]),
-            (sc_tbp,       dyn_pts[9]),
-            (sc_tscale_bp, dyn_pts[10]),
-            (sc_tbbs,      dyn_pts[11]),
-        ] {
+        ];
+        let mut per_scalars = vec![
+            sc_aprime, sc_ctotal, sc_kprime, sc_cbp, sc_abar,
+            sc_ttotal, sc_tscale_t, sc_trefund, sc_tscale_r,
+            sc_tbp, sc_tscale_bp, sc_tbbs,
+        ];
+        if let (Some(pt), Some(sc)) = (extra_point_proj, extra_scalar_opt) {
+            dyn_pts_proj.push(pt);
+            per_scalars.push(sc);
+        }
+        let dyn_pts = batch_normalize(&dyn_pts_proj);
+        for (sc, pt) in per_scalars.into_iter().zip(dyn_pts.into_iter()) {
             dyn_bases.push(pt);
             dyn_scalars.push(&rho * &sc);
         }
@@ -592,7 +775,7 @@ pub fn verify_spend_batch(
     fixed_sum = &fixed_sum + &generators.h_tables[4].mul(&acc_h4);
     fixed_sum = &fixed_sum + &generators.g1_table.mul(&acc_g1);
 
-    // Variable-base part: N×12 dynamic points via Pippenger MSM.
+    // Variable-base part: dynamic points via Pippenger MSM.
     let combined = &fixed_sum + &g1_msm(&dyn_bases, &dyn_scalars);
     if !bool::from(combined.is_identity()) {
         return Err(ActError::VerificationFailed("Batched Schnorr check failed".into()));
@@ -620,7 +803,10 @@ pub fn verify_spend_batch(
         .map(|((proof, nonce), pp)| {
             let mut beq_ctx = Vec::new();
             beq_ctx.extend_from_slice(&h_ctx.to_bytes());
-            beq_ctx.extend_from_slice(&proof.s.to_le_bytes());
+            match proof.c_s {
+                Some(c_s) => beq_ctx.extend_from_slice(&G1Affine::from(c_s).to_compressed()),
+                None      => beq_ctx.extend_from_slice(&proof.s.to_le_bytes()),
+            }
             beq_ctx.extend_from_slice(&proof.k_cur.to_bytes());
             beq_ctx.extend_from_slice(&proof.t_issue.to_le_bytes());
             beq_ctx.extend_from_slice(nonce);
@@ -631,11 +817,41 @@ pub fn verify_spend_batch(
                 G1Affine::from(proof.k_prime),
                 G1Affine::from(pp.c_total),
             ];
+            // Verify refund range BEQ.
             verify_batched_equality(
                 &proof.batched_eq, proof.c_bp,
                 generators.h[4], generators.h[0],
                 &beq_ctx, &beq_commitments,
-            )
+            )?;
+            // For hidden-spend proofs, also verify the spend range BEQ.
+            if let (Some(c_s), Some(beq_spend)) = (proof.c_s, &proof.beq_spend) {
+                let mut beq_spend_ctx = Vec::new();
+                beq_spend_ctx.extend_from_slice(&h_ctx.to_bytes());
+                beq_spend_ctx.extend_from_slice(b"ACT:HiddenSpend");
+                beq_spend_ctx.extend_from_slice(&proof.k_cur.to_bytes());
+                beq_spend_ctx.extend_from_slice(&proof.t_issue.to_le_bytes());
+                beq_spend_ctx.extend_from_slice(nonce);
+                let beq_spend_comms = [
+                    G1Affine::from(proof.a_prime),
+                    G1Affine::from(proof.a_bar),
+                    G1Affine::from(proof.t_bbs),
+                    G1Affine::from(c_s),
+                ];
+                let c_s_minus_h4 = c_s - generators.h[4];
+                verify_batched_equality(
+                    beq_spend,
+                    c_s_minus_h4,
+                    generators.h[4],
+                    generators.h[0],
+                    &beq_spend_ctx,
+                    &beq_spend_comms,
+                )?;
+            } else if proof.c_s.is_some() {
+                return Err(ActError::VerificationFailed(
+                    "Hidden spend proof missing spend range proof".into(),
+                ));
+            }
+            Ok(())
         })
         .collect();
     for r in beq_check_results {
@@ -709,11 +925,12 @@ mod tests {
         let token = daily_sig(&mut rng, k_cur, c_bal, t_issue, &generators, &keys);
 
         let (client, proof) = SpendProver::prove(
-            &mut rng, &token, k_cur, c_bal, t_issue, 30, &[0xAAu8; 16],
+            &mut rng, &token, k_cur, c_bal, t_issue, 30, false, &[0xAAu8; 16],
             &generators, &keys.pk_daily, h_ctx,
         ).unwrap();
         let resp = verify_spend(
             &proof, t_issue, &[0xAAu8; 16], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, None,
         ).unwrap();
         let refund = BbsSignature {
             a: resp.a_refund,
@@ -733,7 +950,7 @@ mod tests {
         let k_cur = Scalar::rand_nonzero(&mut rng);
         let token = daily_sig(&mut rng, k_cur, 50, 42, &generators, &keys);
         assert!(SpendProver::prove(
-            &mut rng, &token, k_cur, 50, 42, 100, &[0xAAu8; 16],
+            &mut rng, &token, k_cur, 50, 42, 100, false, &[0xAAu8; 16],
             &generators, &keys.pk_daily, h_ctx,
         ).is_err());
     }
@@ -747,11 +964,12 @@ mod tests {
         let k_cur = Scalar::rand_nonzero(&mut rng);
         let token = daily_sig(&mut rng, k_cur, 100, 42, &generators, &keys);
         let (_client, proof) = SpendProver::prove(
-            &mut rng, &token, k_cur, 100, 42, 30, &[0xAAu8; 16],
+            &mut rng, &token, k_cur, 100, 42, 30, false, &[0xAAu8; 16],
             &generators, &keys.pk_daily, h_ctx,
         ).unwrap();
         assert!(verify_spend(
             &proof, 42, &[0xBBu8; 16], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, None,
         ).is_err());
     }
 
@@ -763,6 +981,7 @@ mod tests {
         let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
         let responses = verify_spend_batch(
             &[], 42, &[], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, None,
         ).unwrap();
         assert!(responses.is_empty());
     }
@@ -778,11 +997,12 @@ mod tests {
         let token = daily_sig(&mut rng, k_cur, 100, t_issue, &generators, &keys);
         let nonce = [0xAAu8; 16];
         let (_client, proof) = SpendProver::prove(
-            &mut rng, &token, k_cur, 100, t_issue, 30, &nonce,
+            &mut rng, &token, k_cur, 100, t_issue, 30, false, &nonce,
             &generators, &keys.pk_daily, h_ctx,
         ).unwrap();
         let responses = verify_spend_batch(
             &[proof], t_issue, &[nonce], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, None,
         ).unwrap();
         assert_eq!(responses.len(), 1);
         assert!(!bool::from(responses[0].a_refund.is_identity()));
@@ -805,7 +1025,7 @@ mod tests {
             let mut nonce = [0u8; 16];
             nonce[0] = i as u8;
             let (_client, proof) = SpendProver::prove(
-                &mut rng, &token, k_cur, 100, t_issue, 20, &nonce,
+                &mut rng, &token, k_cur, 100, t_issue, 20, false, &nonce,
                 &generators, &keys.pk_daily, h_ctx,
             ).unwrap();
             proofs.push(proof);
@@ -814,6 +1034,7 @@ mod tests {
 
         let responses = verify_spend_batch(
             &proofs, t_issue, &nonces, &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, None,
         ).unwrap();
         assert_eq!(responses.len(), BATCH);
         for r in &responses {
@@ -838,7 +1059,7 @@ mod tests {
             let mut nonce = [0u8; 16];
             nonce[0] = i as u8;
             let (_client, proof) = SpendProver::prove(
-                &mut rng, &token, k_cur, 100, t_issue, 20, &nonce,
+                &mut rng, &token, k_cur, 100, t_issue, 20, false, &nonce,
                 &generators, &keys.pk_daily, h_ctx,
             ).unwrap();
             proofs.push(proof);
@@ -850,7 +1071,7 @@ mod tests {
             let token = daily_sig(&mut rng, k_cur, 100, t_issue, &generators, &keys2);
             let nonce = [0xFFu8; 16];
             let (_client, bad_proof) = SpendProver::prove(
-                &mut rng, &token, k_cur, 100, t_issue, 20, &nonce,
+                &mut rng, &token, k_cur, 100, t_issue, 20, false, &nonce,
                 &generators, &keys2.pk_daily, h_ctx,
             ).unwrap();
             proofs.push(bad_proof);
@@ -858,6 +1079,162 @@ mod tests {
         }
         assert!(verify_spend_batch(
             &proofs, t_issue, &nonces, &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, None,
         ).is_err());
+    }
+
+    // ── Hidden spend tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn hidden_spend_roundtrip() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let k_cur = Scalar::rand_nonzero(&mut rng);
+        let c_bal = 100u32;
+        let t_issue = 42u32;
+        let token = daily_sig(&mut rng, k_cur, c_bal, t_issue, &generators, &keys);
+
+        let (client, proof) = SpendProver::prove(
+            &mut rng, &token, k_cur, c_bal, t_issue, 30, true, &[0xCCu8; 16],
+            &generators, &keys.pk_daily, h_ctx,
+        ).unwrap();
+        // hidden: s field must be 0, c_s must be present
+        assert_eq!(proof.s, 0);
+        assert!(proof.c_s.is_some());
+        assert!(proof.beq_spend.is_some());
+
+        // Server in flexible mode (required_spend_amount = None)
+        let resp = verify_spend(
+            &proof, t_issue, &[0xCCu8; 16], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, None,
+        ).unwrap();
+        let refund = BbsSignature {
+            a: resp.a_refund,
+            e: resp.e_refund,
+            s: client.r_star + resp.s_prime_refund,
+        };
+        assert!(!bool::from(refund.a.is_identity()));
+    }
+
+    #[test]
+    fn hidden_spend_rejected_when_server_enforces_amount() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let k_cur = Scalar::rand_nonzero(&mut rng);
+        let token = daily_sig(&mut rng, k_cur, 100, 42, &generators, &keys);
+        let (_client, proof) = SpendProver::prove(
+            &mut rng, &token, k_cur, 100, 42, 30, true, &[0xAAu8; 16],
+            &generators, &keys.pk_daily, h_ctx,
+        ).unwrap();
+        // Server enforces spend = 30 → hidden proof must be rejected.
+        assert!(verify_spend(
+            &proof, 42, &[0xAAu8; 16], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, Some(30),
+        ).is_err());
+    }
+
+    #[test]
+    fn revealed_spend_amount_enforced_correctly() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let k_cur = Scalar::rand_nonzero(&mut rng);
+        let token = daily_sig(&mut rng, k_cur, 100, 42, &generators, &keys);
+        let (_client, proof) = SpendProver::prove(
+            &mut rng, &token, k_cur, 100, 42, 30, false, &[0xAAu8; 16],
+            &generators, &keys.pk_daily, h_ctx,
+        ).unwrap();
+        // Correct amount enforcement: OK.
+        assert!(verify_spend(
+            &proof, 42, &[0xAAu8; 16], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, Some(30),
+        ).is_ok());
+        // Wrong amount enforcement: rejected.
+        assert!(verify_spend(
+            &proof, 42, &[0xAAu8; 16], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, Some(99),
+        ).is_err());
+    }
+
+    // ── Grace-period / epoch tests ────────────────────────────────────────────
+
+    #[test]
+    fn prev_epoch_accepted_with_grace() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let k_cur = Scalar::rand_nonzero(&mut rng);
+        let t_issue = 41u32;
+        let current_epoch = 42u32;  // t_issue + 1 → previous epoch
+        let token = daily_sig(&mut rng, k_cur, 100, t_issue, &generators, &keys);
+        let (_client, proof) = SpendProver::prove(
+            &mut rng, &token, k_cur, 100, t_issue, 10, false, &[0xAAu8; 16],
+            &generators, &keys.pk_daily, h_ctx,
+        ).unwrap();
+        // Grace period on → should accept previous epoch.
+        assert!(verify_spend(
+            &proof, current_epoch, &[0xAAu8; 16], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            true, None,
+        ).is_ok());
+    }
+
+    #[test]
+    fn prev_epoch_rejected_without_grace() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let k_cur = Scalar::rand_nonzero(&mut rng);
+        let t_issue = 41u32;
+        let current_epoch = 42u32;
+        let token = daily_sig(&mut rng, k_cur, 100, t_issue, &generators, &keys);
+        let (_client, proof) = SpendProver::prove(
+            &mut rng, &token, k_cur, 100, t_issue, 10, false, &[0xAAu8; 16],
+            &generators, &keys.pk_daily, h_ctx,
+        ).unwrap();
+        // Grace period off (zero-grace default) → previous epoch must be rejected.
+        assert!(verify_spend(
+            &proof, current_epoch, &[0xAAu8; 16], &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, None,
+        ).is_err());
+    }
+
+    #[test]
+    fn hidden_spend_batch_roundtrip() {
+        let mut rng = thread_rng();
+        let generators = Generators::new();
+        let keys = ServerKeys::generate(&mut rng);
+        let h_ctx = compute_h_ctx("test-app", &keys.pk_master, &keys.pk_daily, &generators);
+        let t_issue = 42u32;
+
+        const BATCH: usize = 3;
+        let mut proofs = Vec::with_capacity(BATCH);
+        let mut nonces: Vec<[u8; 16]> = Vec::with_capacity(BATCH);
+        for i in 0..BATCH {
+            let k_cur = Scalar::rand_nonzero(&mut rng);
+            let token = daily_sig(&mut rng, k_cur, 100, t_issue, &generators, &keys);
+            let mut nonce = [0u8; 16];
+            nonce[0] = i as u8;
+            let (_client, proof) = SpendProver::prove(
+                &mut rng, &token, k_cur, 100, t_issue, 20, true, &nonce,
+                &generators, &keys.pk_daily, h_ctx,
+            ).unwrap();
+            proofs.push(proof);
+            nonces.push(nonce);
+        }
+        let responses = verify_spend_batch(
+            &proofs, t_issue, &nonces, &generators, &keys.pk_daily, &keys, h_ctx, &mut rng,
+            false, None,
+        ).unwrap();
+        assert_eq!(responses.len(), BATCH);
+        for r in &responses {
+            assert!(!bool::from(r.a_refund.is_identity()));
+        }
     }
 }
